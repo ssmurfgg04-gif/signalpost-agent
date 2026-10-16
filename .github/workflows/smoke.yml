@@ -1,0 +1,76 @@
+name: smoke-batch
+
+# Live 100-company Signalpost smoke run on a GitHub runner (the local sandbox
+# cannot reach data.brreg.no). Produces the envelopes + report used to verify
+# the agent before submitting.
+on:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: 'companies in the batch'
+        default: '100'
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.12'
+
+      - name: replay sample first (no network)
+        run: |
+          uv sync
+          uv run python scripts/run_refresh_replay.py \
+            --manifest tests/fixtures/refresh-snapshots.json \
+            --output out/refresh-demo.json
+          uv run --with pytest pytest -q
+
+      - name: fetch data
+        run: |
+          curl -sL 'https://data.brreg.no/enhetsregisteret/api/enheter/lastned/csv' -o brreg-enheter.csv
+          curl -sL 'https://builderr.ai/signalpost-company-universe-2025.jsonl.gz' -o signalpost-universe.jsonl.gz
+          ls -la brreg-enheter.csv signalpost-universe.jsonl.gz
+
+      - name: select batch
+        run: |
+          uv run python select_entry_batch.py \
+            --universe signalpost-universe.jsonl.gz \
+            --count ${{ inputs.count || '100' }} \
+            --output entry-companies.jsonl
+
+      - name: live smoke batch
+        run: |
+          uv run python scripts/run_competition_batch.py \
+            --organisations entry-companies.jsonl \
+            --bulk brreg-enheter.csv \
+            --profiles-output out/smoke-profiles.jsonl \
+            --output out/smoke-envelopes.jsonl \
+            --report out/smoke-report.json \
+            --run-id smoke-${{ github.run_number }} \
+            --expected-count ${{ inputs.count || '100' }}
+
+      - name: summary
+        run: |
+          cat out/smoke-report.json
+          {
+            echo "## Signalpost smoke batch"
+            echo '```'
+            cat out/smoke-report.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smoke-run
+          path: |
+            out/smoke-profiles.jsonl
+            out/smoke-envelopes.jsonl
+            out/smoke-report.json
+            entry-companies.jsonl
